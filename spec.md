@@ -33,6 +33,16 @@ Content-Type: application/json
 
 Where `<normalized_name>` is the contestant name after normalization, capitalized (e.g., `"Thompson"`).
 
+**400 Bad Request — No client IP**
+
+```json
+{
+  "detail": "Unable to determine client IP."
+}
+```
+
+Returned when `request.client` is `None`.
+
 **400 Bad Request — Invalid JSON body**
 
 ```json
@@ -123,20 +133,50 @@ Returned when the `User-Agent` header is absent or empty in the request.
 
 Returned when the IP address has made more than 10 requests within the last 60 seconds.
 
+**500 Internal Server Error — Database error**
+
+```json
+{
+  "detail": "Internal server error."
+}
+```
+
+Returned when an unexpected database exception occurs. Never expose tracebacks or internal details to the client. The server must run with `debug=False`.
+
 ### HTTP Status Code Summary
 
 | Code | Meaning                  | When                                         |
 |------|--------------------------|----------------------------------------------|
 | 200  | OK                       | Vote successfully recorded                   |
-| 400  | Bad Request              | Invalid JSON, missing field, bad type, too long, empty after normalization |
+| 400  | Bad Request              | No client IP, invalid JSON, missing field, bad type, too long, empty after normalization |
 | 404  | Not Found                | Contestant not in roster                     |
 | 409  | Conflict                 | Duplicate vote (fingerprint already exists)  |
 | 422  | Unprocessable Entity     | Missing or empty User-Agent header           |
 | 429  | Too Many Requests        | Rate limit exceeded (>10 req/min per IP)     |
+| 500  | Internal Server Error    | Unexpected database error                    |
 
 ---
 
 ## 2. Data Model
+
+### Database Lifecycle
+
+The database connection is managed via **FastAPI's lifespan** context manager:
+
+- **Startup**: open a `sqlite3` connection to `votes.db`, enable WAL mode and busy timeout, run `CREATE TABLE IF NOT EXISTS`, and store the connection on `app.state.db`.
+- **Shutdown**: close the connection.
+
+```python
+@asynccontextmanager
+async def lifespan(app):
+    db = sqlite3.connect("votes.db")
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute(CREATE_TABLE_SQL)
+    app.state.db = db
+    yield
+    db.close()
+```
 
 ### SQLite Schema
 
@@ -157,7 +197,7 @@ CREATE TABLE IF NOT EXISTS votes (
 |-------------|-----------|--------------------------|-----------------------------------------------|
 | `id`         | INTEGER   | PRIMARY KEY AUTOINCREMENT | Auto-incrementing unique row identifier       |
 | `contestant` | TEXT      | NOT NULL                 | Normalized contestant last name (lowercase)   |
-| `fingerprint`| TEXT      | NOT NULL, UNIQUE         | SHA-256 hash of IP + User-Agent               |
+| `fingerprint`| TEXT      | NOT NULL, UNIQUE         | SHA-256 hash of IP + `"|"` + User-Agent       |
 | `ip_address` | TEXT      | NOT NULL                 | Client IP from `request.client.host`          |
 | `user_agent` | TEXT      | NOT NULL                 | Raw User-Agent header value                   |
 | `created_at` | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | Time the vote was recorded                    |
@@ -214,7 +254,7 @@ Three steps applied in order:
 | `"  O'Kafor  "`        | `"O'Kafor"`           | `"o'kafor"`           | `"okafor"`            | Valid     |
 | `"CHEN"`               | `"CHEN"`              | `"chen"`              | `"chen"`              | Valid     |
 | `"  na-ka-mu-ra  "`    | `"na-ka-mu-ra"`       | `"na-ka-mu-ra"`       | `"nakamura"`          | Valid     |
-| `"Martínez"`           | `"Martínez"`          | `"martínez"`          | `"martnez"`           | Valid     |
+| `"Martínez"`           | `"Martínez"`          | `"martínez"`          | `"martnez"`           | Not Found |
 | `"Willi@ms!"`          | `"Willi@ms!"`         | `"willi@ms!"`         | `"willims"`           | Not Found |
 | `"   "`                | `""`                  | `""`                  | `""`                  | Empty     |
 | `"123"`                | `"123"`               | `"123"`               | `""`                  | Empty     |
@@ -229,20 +269,39 @@ Three steps applied in order:
 ### Device Fingerprint
 
 ```
-fingerprint = SHA-256(ip_address + user_agent)
+fingerprint = SHA-256(ip_address + "|" + user_agent)
 ```
 
-- **IP address**: obtained from `request.client.host`. Never use `X-Forwarded-For` or any proxy header.
+- **IP address**: obtained from `request.client.host`, normalized (see below). Never use `X-Forwarded-For` or any proxy header.
 - **User-Agent**: raw value from the `User-Agent` HTTP header.
-- **Hash**: SHA-256 of the concatenation (no separator), output as lowercase hex string.
+- **Separator**: a literal pipe character `"|"` between IP and User-Agent to prevent collisions (e.g., IP `"1.2.3.4"` + UA `"5Mozilla"` vs IP `"1.2.3.45"` + UA `"Mozilla"` would collide without a delimiter).
+- **Hash**: SHA-256 of the delimited concatenation, output as lowercase hex string.
 
 Example:
 ```
 IP: "127.0.0.1"
 User-Agent: "Mozilla/5.0"
-Input: "127.0.0.1Mozilla/5.0"
-Fingerprint: SHA-256("127.0.0.1Mozilla/5.0") → "a1b2c3..."
+Input: "127.0.0.1|Mozilla/5.0"
+Fingerprint: SHA-256("127.0.0.1|Mozilla/5.0") → "a1b2c3..."
 ```
+
+### IP Normalization
+
+Before using the IP address for fingerprinting or rate limiting, normalize it using Python's `ipaddress` module to prevent IPv4-mapped IPv6 addresses from creating different fingerprints than their IPv4 equivalents:
+
+```python
+import ipaddress
+
+def normalize_ip(raw_ip: str) -> str:
+    addr = ipaddress.ip_address(raw_ip)
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        return str(addr.ipv4_mapped)
+    return str(addr)
+```
+
+Example: `"::ffff:127.0.0.1"` normalizes to `"127.0.0.1"`.
+
+The normalized IP is used for both the fingerprint hash and rate-limit key. The raw `request.client.host` value is stored in the `ip_address` column for debugging.
 
 ### Enforcement
 
@@ -256,25 +315,35 @@ Fingerprint: SHA-256("127.0.0.1Mozilla/5.0") → "a1b2c3..."
 
 ### Mechanism
 
-- In-memory Python dictionary: `dict[str, list[float]]` mapping IP address to a list of request timestamps.
+- In-memory Python dictionary: `dict[str, list[float]]` mapping normalized IP address to a list of request timestamps.
+- Protected by an `asyncio.Lock` to ensure safety under concurrent async access.
 - On each request, before any other processing:
-  1. Get the current time.
-  2. Retrieve the list of timestamps for this IP.
-  3. Filter out timestamps older than 60 seconds.
-  4. If the filtered list has 10 or more entries, return 429.
-  5. Otherwise, append the current timestamp and proceed.
+  1. Acquire the lock.
+  2. Get the current time.
+  3. Retrieve the list of timestamps for this IP.
+  4. Filter out timestamps older than 60 seconds.
+  5. If the filtered list has 10 or more entries, release the lock and return 429.
+  6. Otherwise, append the current timestamp.
+  7. **Periodic sweep**: every 50 requests (tracked by a global counter), iterate the dictionary and remove entries where all timestamps are older than 60 seconds. This prevents unbounded memory growth from stale IPs.
+  8. Release the lock and proceed.
 
 ### Parameters
 
-| Parameter     | Value |
-|--------------|-------|
-| Window        | 60 seconds |
-| Max requests  | 10 per IP per window |
-| Storage       | In-memory dictionary (resets on server restart) |
+| Parameter       | Value |
+|----------------|-------|
+| Window          | 60 seconds |
+| Max requests    | 10 per IP per window |
+| Storage         | In-memory dictionary (resets on server restart) |
+| Sweep interval  | Every 50 requests |
+| Concurrency     | `asyncio.Lock` protects all dict access |
+
+### Deployment Constraint
+
+The in-memory rate limiter is **not shared across OS processes**. The application MUST be run with `--workers 1` (single Uvicorn worker). This constraint should be documented in the project README.
 
 ### Scope
 
-Rate limiting applies to the `/api/vote` endpoint only. It counts all requests regardless of whether the vote is valid.
+Rate limiting applies to the `/api/vote` endpoint only. It counts all requests regardless of whether the vote is valid. The rate-limit key is the **normalized** IP address (see IP Normalization).
 
 ---
 
@@ -283,21 +352,27 @@ Rate limiting applies to the `/api/vote` endpoint only. It counts all requests r
 Requests to `POST /api/vote` are processed in this exact order:
 
 ```
-1. Rate limit check         → 429 if exceeded
-2. Parse JSON body          → 400 if invalid JSON or not an object
-3. Check 'contestant' field → 400 if missing
-4. Check type is string     → 400 if not a string
-5. Max length check (100)   → 400 if > 100 characters
-6. Normalize name           → (trim, lowercase, strip non-alpha)
-7. Empty check              → 400 if empty after normalization
-8. Roster check             → 404 if not in contestant set
-9. Check User-Agent header  → 422 if missing or empty
-10. Compute fingerprint     → SHA-256(IP + User-Agent)
-11. Insert vote into DB     → 409 if duplicate fingerprint
-12. Return success          → 200
+ 1. Check request.client      → 400 if None (no client IP available)
+ 2. Rate limit check          → 429 if exceeded
+ 3. Parse JSON body manually  → 400 if invalid JSON or not an object
+ 4. Check 'contestant' field  → 400 if missing
+ 5. Check type is string      → 400 if not a string
+ 6. Max length check (100)    → 400 if > 100 characters
+ 7. Normalize name            → (trim, lowercase, strip non-alpha)
+ 8. Empty check               → 400 if empty after normalization
+ 9. Roster check              → 404 if not in contestant set
+10. Check User-Agent header   → 422 if missing or empty
+11. Normalize IP address      → (see IP Normalization below)
+12. Compute fingerprint       → SHA-256(normalized_ip + "|" + user_agent)
+13. Insert vote into DB       → 409 if duplicate fingerprint
+14. Return success            → 200
 ```
 
 This order ensures that cheap checks run first and expensive operations (DB writes) run last.
+
+**Step 1 — request.client**: If `request.client` is `None` (which can happen in certain ASGI configurations), return 400 with `{"detail": "Unable to determine client IP."}`.
+
+**Step 3 — Manual JSON parsing**: Do NOT rely on FastAPI/Pydantic auto-validation for the request body. Instead, parse the body manually using `await request.json()` inside a `try/except` block. This gives full control over error messages and status codes (FastAPI's auto-validation returns 422 with a different error format than specified). A Pydantic `VoteRequest` model MAY be kept in the code as documentation, but must not be used as a route parameter type.
 
 ---
 
@@ -328,7 +403,29 @@ This order ensures that cheap checks run first and expensive operations (DB writ
 
 ---
 
-## 9. Frontend Specification
+## 9. Logging
+
+Use Python's built-in `logging` module. Configure a logger named `"agt"` at `INFO` level.
+
+### What to Log
+
+| Level     | Event                                      | Example message                              |
+|-----------|--------------------------------------------|----------------------------------------------|
+| `INFO`    | Vote successfully recorded                 | `"Vote recorded: contestant=thompson"`        |
+| `WARNING` | Duplicate vote rejected                    | `"Duplicate vote rejected"`                   |
+| `WARNING` | Rate limit exceeded                        | `"Rate limit exceeded for IP"`                |
+| `WARNING` | Validation error (any 400/404/422)         | `"Validation error: Missing required field: contestant."` |
+| `ERROR`   | Database exception                         | `"Database error: <exception message>"`       |
+
+### What NOT to Log
+
+- Do **not** log raw IP addresses (use `"IP"` as placeholder in messages).
+- Do **not** log User-Agent strings.
+- Do **not** log request bodies.
+
+---
+
+## 10. Frontend Specification
 
 ### Page Setup
 
@@ -361,9 +458,10 @@ const [voted, setVoted] = useState(false)
 3. Button shows loading state (`loading = true`). Form is disabled during request.
 4. Frontend sends `POST` to `${NEXT_PUBLIC_API_URL}/api/vote` with `{ "contestant": value }`.
 5. On success (200): set `message` from response, `severity = "success"`, `voted = true`.
-6. On error (4xx): set `message` from `detail` field, `severity = "error"`.
-7. After successful vote (`voted = true`): TextField and Button are disabled permanently for the session.
-8. The Alert is only displayed when `message` is non-empty.
+6. On error (4xx/5xx): set `message` from `detail` field, `severity = "error"`.
+7. On network failure (fetch throws): set `message = "Network error. Please try again."`, `severity = "error"`.
+8. After successful vote (`voted = true`): TextField and Button are disabled permanently for the session.
+9. The Alert is only displayed when `message` is non-empty.
 
 ### Contestant List Display
 
@@ -382,13 +480,13 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 ### CORS
 
 The FastAPI backend must allow CORS requests from the frontend origin. Configure via `CORSMiddleware` with:
-- `allow_origins=["*"]` (for development; tighten for production)
+- `allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"]`
 - `allow_methods=["POST"]`
-- `allow_headers=["*"]`
+- `allow_headers=["Content-Type"]`
 
 ---
 
-## 10. Edge Cases
+## 11. Edge Cases
 
 | # | Input / Scenario                     | Expected Behavior                              | HTTP Status |
 |---|--------------------------------------|------------------------------------------------|-------------|
